@@ -2,12 +2,8 @@ name: Run Google Sheet Auto-Update Cronjob
 
 on:
   schedule:
-    # Cấu hình lịch chạy theo cú pháp Cron (UTC Time).
-    # Ví dụ dưới đây: Chạy mỗi 15 phút 1 lần.
-    # Lưu ý: Giờ UTC = Giờ Việt Nam - 7 tiếng.
     - cron: '*/15 * * * *'
   
-  # Cho phép bấm nút "Run workflow" thủ công trên web để test ngay bất kỳ lúc nào
   workflow_dispatch:
 
 jobs:
@@ -15,23 +11,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Tải code từ Repository về máy ảo
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      # 2. Cài đặt môi trường Python 3.10
       - name: Set up Python
-        uses: actions/checkout@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 3. Cài đặt các thư viện cần thiết
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. Thực thi script Python
       - name: Execute Python script
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
