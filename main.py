@@ -19,12 +19,10 @@ DATA_SHEET_ID = "1YrgKGSUsPTBMxm39qeM8QRxalhfLQD3Zg8gozx6KTgM"
 CX_LINKEDIN = "a6be6e8ccdb58403b"
 SECRET_TOKEN = "MySuperSecretToken123"
 
-MAX_BATCH_SIZE = 60
-
 CHECK_DELAY = 0.5
-SEARCH_DELAY = 2.0
-GEMINI_DELAY_BASE = 5.0
-GEMINI_DELAY_JITTER = 2.0
+SEARCH_DELAY = 1.5
+GEMINI_DELAY_BASE = 4.0
+GEMINI_DELAY_JITTER = 1.5
 
 def sleep_with_jitter(base=GEMINI_DELAY_BASE, jitter=GEMINI_DELAY_JITTER):
     time.sleep(base + random.uniform(0, jitter))
@@ -123,7 +121,6 @@ def run_api_sheet_audit(api_sheet):
     if len(all_rows) < 4:
         return
 
-    # Chuẩn bị dữ liệu cập nhật gộp cho B4 trở xuống
     status_updates = []
     
     for i, row in enumerate(all_rows[3:]):
@@ -152,7 +149,6 @@ def run_api_sheet_audit(api_sheet):
         status_updates.append([status_msg])
         time.sleep(CHECK_DELAY)
 
-    # GHI TẤT CẢ TRẠNG THÁI BẰNG CHỈ 1 LỆNH UPDATE DUY NHẤT VÀO CỘT B
     end_row = 3 + len(status_updates)
     safe_sheet_update(api_sheet, f"B4:B{end_row}", status_updates)
     print("✅ Cập nhật trạng thái Audit Keys hoàn tất (1 Batch Write).")
@@ -253,14 +249,14 @@ def is_high_confidence(status_text):
 # MAIN AUTOMATION WORKFLOW (CHỈ XỬ LÝ A -> G)
 # ==========================================
 def run_automation_logic():
-    print("🚀 Cronjob Triggered: Bắt đầu tiến trình tự động...")
+    print("🚀 Bắt đầu tiến trình tự động...")
     try:
         gc = get_gspread_client()
         gemini_sheet = gc.open_by_key(API_KEY_SHEET_ID).worksheet("Gemini API")
         api_sheet = gc.open_by_key(API_KEY_SHEET_ID).worksheet("Custom Search API")
         data_sheet = gc.open_by_key(DATA_SHEET_ID).worksheet("search example")
 
-        # 0. AUDIT API KEYS (Tiết kiệm Quota)
+        # 0. AUDIT API KEYS
         run_api_sheet_audit(api_sheet)
 
         # Nạp Key Managers
@@ -271,31 +267,37 @@ def run_automation_logic():
         gemini_key_mgr.load()
 
         # 1. BƯỚC 1: QUÉT TÌM CEO PROFILE (CỘT B:F TRỐNG)
-        print("\n⏳ [PHẦN 1] Kiểm tra danh sách tìm CEO Profile...")
+        print("\n⏳ [PHẦN 1] Kiểm tra toàn bộ danh sách tìm CEO Profile...")
         data_matrix = data_sheet.get_all_values()
         rows = data_matrix[1:]
 
         todo_search = []
         for i, row in enumerate(rows):
             company = row[0].strip() if len(row) > 0 else ""
+            col_b = row[1].strip() if len(row) > 1 else ""
             col_e = row[4].strip() if len(row) > 4 else ""
             col_f = row[5].strip() if len(row) > 5 else ""
 
-            if company and col_e == "" and col_f == "":
+            # Chỉ tìm nếu có tên cty VÀ chưa từng được xử lý (Cột B, E, F đều trống)
+            if company and col_b == "" and col_e == "" and col_f == "":
                 todo_search.append({"idx": i + 2, "name": company})
-                if len(todo_search) >= MAX_BATCH_SIZE:
-                    break
 
         if todo_search:
             print(f"🚀 Xử lý {len(todo_search)} dòng cần tìm CEO Profile...")
+            keys_exhausted = False
+
             for task in todo_search:
+                if keys_exhausted:
+                    break
+
                 row_idx = task["idx"]
                 company_query = task["name"]
 
                 while True:
                     api_obj = search_key_mgr.current()
                     if not api_obj:
-                        print("🛑 HẾT KEY SEARCH KHẢ DỤNG!")
+                        print("🛑 HẾT KEY SEARCH KHẢ DỤNG! Dừng Phần 1.")
+                        keys_exhausted = True
                         break
 
                     api_key = api_obj['key']
@@ -336,8 +338,10 @@ def run_automation_logic():
                             print(f" ✅ [{row_idx}] Updated B:F cho {company_query}")
 
                         else:
-                            safe_sheet_update(data_sheet, f"B{row_idx}", [["- Không tìm thấy"]])
-                            print(f" ➖ [{row_idx}] Không có kết quả cho {company_query}.")
+                            # ĐIỀN ĐỦ B:F ĐỂ TRÁNH BỊ LẶP LẠI Ở LẦN CHẠY SAU
+                            payload = ["- Không tìm thấy", "-", "-", "❌ Không tìm thấy", "Không có kết quả Google Search"]
+                            safe_sheet_update(data_sheet, f"B{row_idx}:F{row_idx}", [payload])
+                            print(f" ➖ [{row_idx}] Không có kết quả cho {company_query}. Đã đóng dòng B:F.")
 
                         sleep_with_jitter()
                         break
@@ -348,17 +352,13 @@ def run_automation_logic():
         else:
             print("✅ Không có dòng nào trống ở phần CEO Profile (Cột B:F).")
 
-        # Đợi 3 giây trước khi chuyển sang PHẦN 2 để làm rỗng Quota Rate Limit
         time.sleep(3)
 
         # 2. BƯỚC 2: QUÉT TÌM VỊ TRÍ CEO (CỘT G TRỐNG & CONFIDENCE CAO)
-        print("\n⏳ [PHẦN 2] Kiểm tra Vị trí CEO (Cột G)...")
+        print("\n⏳ [PHẦN 2] Kiểm tra toàn bộ Vị trí CEO (Cột G)...")
         all_rows_updated = data_sheet.get_all_values()
-        count_g = 0
-
+        
         for i, row in enumerate(all_rows_updated[1:]):
-            if count_g >= MAX_BATCH_SIZE:
-                break
             row_idx = i + 2
             company = row[0].strip() if len(row) > 0 else ""
             linkedin_url = row[1].strip() if len(row) > 1 else ""
@@ -367,14 +367,17 @@ def run_automation_logic():
             location_filled = len(row) > 6 and row[6].strip()
 
             if is_high_confidence(confidence_status) and not location_filled:
-                if not ceo_name:
+                if not gemini_key_mgr.current_key():
+                    print("🛑 HẾT KEY GEMINI KHẢ DỤNG! Dừng Phần 2.")
+                    break
+
+                if not ceo_name or ceo_name == "-":
                     safe_sheet_update(data_sheet, f"G{row_idx}", [["-"]])
                     continue
 
                 location = get_location_gemini(ceo_name, company, linkedin_url, gemini_key_mgr)
                 safe_sheet_update(data_sheet, f"G{row_idx}", [[location]])
                 print(f" 📍 [{row_idx}] Updated CEO Location (G): {location}")
-                count_g += 1
                 sleep_with_jitter()
 
         print("\n🏁 HOÀN THÀNH TOÀN BỘ TIẾN TRÌNH AUTOMATION (A -> G).")
