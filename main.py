@@ -263,18 +263,12 @@ def run_automation_logic():
         api_sheet = gc.open_by_key(API_KEY_SHEET_ID).worksheet("Custom Search API")
         data_sheet = gc.open_by_key(DATA_SHEET_ID).worksheet("search example")
 
-        # 0. AUDIT API KEYS (Tiết kiệm Quota)
-        run_api_sheet_audit(api_sheet)
-
-        # Nạp Key Managers
-        search_key_mgr = MultiTabKeyManager(api_sheet, "SEARCH")
-        search_key_mgr.load()
-
-        gemini_key_mgr = MultiTabKeyManager(gemini_sheet, "GEMINI")
-        gemini_key_mgr.load()
-
-        # 1. BƯỚC 1: QUÉT TÌM CEO PROFILE (CỘT B:F TRỐNG)
-        print("\n⏳ [PHẦN 1] Kiểm tra danh sách tìm CEO Profile...")
+        # -------------------------------------------------------------
+        # QUÉT TRƯỚC để biết có việc thực sự cần làm hay không, TRƯỚC KHI
+        # đụng tới bất kỳ API nào (kể cả audit key). Nếu sheet không có
+        # dòng nào cần xử lý (cả Phần 1 lẫn Phần 2), dừng ngay, không tốn
+        # 1 request nào.
+        # -------------------------------------------------------------
         data_matrix = data_sheet.get_all_values()
         rows = data_matrix[1:]
 
@@ -287,6 +281,35 @@ def run_automation_logic():
             if company and col_e == "" and col_f == "":
                 todo_search.append({"idx": i + 2, "name": company})
                 # Đã bỏ giới hạn MAX_BATCH_SIZE -> gom toàn bộ dòng còn trống trong sheet
+
+        has_location_work = False
+        for i, row in enumerate(rows):
+            confidence_status = row[4].strip() if len(row) > 4 else ""
+            location_filled = len(row) > 6 and row[6].strip()
+            if is_high_confidence(confidence_status) and not location_filled:
+                has_location_work = True
+                break
+
+        if not todo_search and not has_location_work:
+            print("✅ Không có dòng nào cần xử lý (Phần 1 & Phần 2 đều trống) -> Bỏ qua audit key, không gọi API.")
+            return
+
+        # 0. AUDIT API KEYS (chỉ audit Custom Search API khi Phần 1 thực sự
+        # có dòng cần tìm CEO Profile, để không tốn quota khi không có việc)
+        if todo_search:
+            run_api_sheet_audit(api_sheet)
+        else:
+            print("ℹ️ Không có dòng cần tìm CEO Profile mới -> Bỏ qua audit Custom Search API Keys.")
+
+        # Nạp Key Managers
+        search_key_mgr = MultiTabKeyManager(api_sheet, "SEARCH")
+        search_key_mgr.load()
+
+        gemini_key_mgr = MultiTabKeyManager(gemini_sheet, "GEMINI")
+        gemini_key_mgr.load()
+
+        # 1. BƯỚC 1: QUÉT TÌM CEO PROFILE (CỘT B:F TRỐNG)
+        print("\n⏳ [PHẦN 1] Kiểm tra danh sách tìm CEO Profile...")
 
         if todo_search:
             print(f"🚀 Xử lý {len(todo_search)} dòng cần tìm CEO Profile...")
