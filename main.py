@@ -19,10 +19,15 @@ DATA_SHEET_ID = "1YrgKGSUsPTBMxm39qeM8QRxalhfLQD3Zg8gozx6KTgM"
 CX_LINKEDIN = "a6be6e8ccdb58403b"
 SECRET_TOKEN = "MySuperSecretToken123"
 
+# MAX_BATCH_SIZE đã được bỏ (không giới hạn số dòng xử lý mỗi lần chạy nữa).
+# Cơ chế chống lặp/lãng phí key vẫn được giữ nguyên: mỗi task chỉ gọi API khi
+# còn key khả dụng (search_key_mgr.current() / gemini_mgr.current_key()),
+# hết key thì break ngay lập tức chứ không gọi thêm request nào.
+
 CHECK_DELAY = 0.5
-SEARCH_DELAY = 1.5
-GEMINI_DELAY_BASE = 4.0
-GEMINI_DELAY_JITTER = 1.5
+SEARCH_DELAY = 2.0
+GEMINI_DELAY_BASE = 5.0
+GEMINI_DELAY_JITTER = 2.0
 
 def sleep_with_jitter(base=GEMINI_DELAY_BASE, jitter=GEMINI_DELAY_JITTER):
     time.sleep(base + random.uniform(0, jitter))
@@ -43,25 +48,21 @@ def get_gspread_client():
         print("⚠️ Không thấy SERVICE_ACCOUNT_JSON trong môi trường, thử tìm file service_account.json local...")
         return gspread.service_account(filename="service_account.json")
 
-def retry_gspread_call(fn, *args, max_retries=5, initial_wait=3, **kwargs):
-    """Bọc các lệnh Google Sheets, tự động retry nếu dính 503, 500 hoặc 429."""
-    wait_sec = initial_wait
-    for attempt in range(1, max_retries + 1):
+def safe_sheet_update(sheet, range_name, values, max_retries=3):
+    """Hàm ghi Sheet an toàn, tự động đợi nếu bị dính Rate Limit (429) của Google Sheets."""
+    for attempt in range(max_retries):
         try:
-            return fn(*args, **kwargs)
+            sheet.update(range_name=range_name, values=values)
+            return True
         except Exception as e:
-            err_str = str(e)
-            if any(code in err_str for code in ["503", "500", "429", "Quota exceeded", "unavailable"]):
-                if attempt == max_retries:
-                    raise e
-                print(f" ⏳ [GSpread {err_str[:35]}...] Thử lại lần {attempt}/{max_retries} sau {wait_sec}s...")
-                time.sleep(wait_sec + random.uniform(0.5, 1.5))
-                wait_sec = min(wait_sec * 2, 60)
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                wait_sec = (attempt + 1) * 10
+                print(f" ⏳ [Google Sheets 429] Bị giới hạn lượt ghi. Đang đợi {wait_sec} giây...")
+                time.sleep(wait_sec)
             else:
-                raise e
-
-def safe_sheet_update(sheet, range_name, values, max_retries=5):
-    return retry_gspread_call(sheet.update, range_name=range_name, values=values, max_retries=max_retries)
+                print(f" ⚠️ Lỗi cập nhật Sheet ({range_name}): {e}")
+                break
+    return False
 
 # ==========================================
 # CLASS QUẢN LÝ KEY ROTATION (ĐA TAB)
@@ -75,7 +76,7 @@ class MultiTabKeyManager:
         self._clients = {}
 
     def load(self):
-        rows = retry_gspread_call(self._sheet.get_all_values)
+        rows = self._sheet.get_all_values()
         self._keys = []
         for i, r in enumerate(rows[3:]):
             row_num = i + 4
@@ -113,11 +114,51 @@ class MultiTabKeyManager:
 
     def _mark(self, row, kind):
         msg = "Key loi (401)" if kind == "401" else "API het luot"
+        safe_sheet_update(self._sheet, f"B{row}", [[msg]])
+        print(f"🛑 [{self._type}] Hàng {row} đánh dấu: {msg}")
+
+# ==========================================
+# BƯỚC 0: AUDIT DẠO API KEYS (GỘP REQUEST BATCH UPDATE)
+# ==========================================
+def run_api_sheet_audit(api_sheet):
+    print("🔄 Đang kiểm tra danh sách Custom Search API Keys...")
+    all_rows = api_sheet.get_all_values()
+    if len(all_rows) < 4:
+        return
+
+    # Chuẩn bị dữ liệu cập nhật gộp cho B4 trở xuống
+    status_updates = []
+    
+    for i, row in enumerate(all_rows[3:]):
+        if not row or not row[0].strip():
+            status_updates.append([""])
+            continue
+
+        api_key = row[0].strip()
+        test_url = f"https://www.googleapis.com/customsearch/v1?q=test&key={api_key}&cx={CX_LINKEDIN}"
+        status_msg = ""
+
         try:
-            safe_sheet_update(self._sheet, f"B{row}", [[msg]])
-            print(f"🛑 [{self._type}] Hàng {row} đánh dấu: {msg}")
-        except Exception as e:
-            print(f"⚠️ Lỗi đánh dấu key hàng {row}: {e}")
+            res = requests.get(test_url, timeout=10)
+            data = res.json()
+            if res.status_code == 200:
+                status_msg = ""
+            elif res.status_code == 401 or "API_KEY_INVALID" in str(data):
+                status_msg = "Key loi (401)"
+            elif res.status_code in [403, 429] or "dailyLimitExceeded" in str(data) or "RESOURCE_EXHAUSTED" in str(data):
+                status_msg = "API het luot"
+            else:
+                status_msg = f"Loi {res.status_code}"
+        except Exception:
+            status_msg = "Conn Error"
+
+        status_updates.append([status_msg])
+        time.sleep(CHECK_DELAY)
+
+    # GHI TẤT CẢ TRẠNG THÁI BẰNG CHỈ 1 LỆNH UPDATE DUY NHẤT VÀO CỘT B
+    end_row = 3 + len(status_updates)
+    safe_sheet_update(api_sheet, f"B4:B{end_row}", status_updates)
+    print("✅ Cập nhật trạng thái Audit Keys hoàn tất (1 Batch Write).")
 
 # ==========================================
 # HÀM AI XÁC MINH & TRA CỨU
@@ -127,24 +168,24 @@ def verify_ceo_with_ai(company_name, name, job, url, gemini_mgr):
 
 Công ty cần tìm: {company_name}
 Người tìm thấy: {name}
-Chức vụ theo Google: {job}
+Chức vụ theo Google (có thể sai hoặc bị lẫn thông tin khác như địa điểm): {job}
 LinkedIn URL: {url}
 
-Đánh giá:
+Đánh giá dựa trên:
 1. Tên công ty trong URL LinkedIn có khớp với công ty cần tìm không?
 2. Chức vụ có phải là CEO, Founder, Co-founder, Director, hoặc tương đương không?
 3. Tên người tìm thấy có hợp lệ không (không phải từ khóa tìm kiếm)?
-4. Nếu "Chức vụ theo Google" thực chất là địa điểm/không liên quan, hãy suy luận trả về chức danh đúng.
+4. QUAN TRỌNG: Nếu "Chức vụ theo Google" thực chất là một địa điểm (vd: "San Francisco, CA") hoặc thông tin không liên quan, hãy suy luận trả về chức danh đúng.
 
-Trả lời JSON thuần:
-{{"verified": true/false, "confidence": "cao/trung bình/thấp", "reason": "lý do ngắn gọn 1 câu", "job_title": "chức vụ chuẩn hóa"}}"""
+Trả lời ĐÚNG format JSON sau, không giải thích thêm:
+{{"verified": true/false, "confidence": "cao/trung bình/thấp", "reason": "lý do ngắn gọn trong 1 câu", "job_title": "chức vụ đã được chuẩn hóa"}}"""
 
     attempt = 0
-    backoff = 4
-    while attempt < 4:
+    backoff = 5
+    while attempt < 5:
         attempt += 1
         if not gemini_mgr.current_key():
-            return {"verified": False, "confidence": "thấp", "reason": "Hết key AI", "job_title": job}
+            return {"verified": None, "confidence": "không xác định", "reason": "Hết key AI", "job_title": job}
 
         try:
             client = gemini_mgr.get_client()
@@ -165,11 +206,11 @@ Trả lời JSON thuần:
                 gemini_mgr.invalidate()
                 continue
             if "503" in err_str or "UNAVAILABLE" in err_str:
-                time.sleep(backoff + random.uniform(0, 3))
-                backoff = min(backoff * 2, 60)
+                time.sleep(backoff + random.uniform(0, 4))
+                backoff = min(backoff * 2, 90)
                 continue
             break
-    return {"verified": False, "confidence": "thấp", "reason": "Lỗi AI", "job_title": job}
+    return {"verified": None, "confidence": "không xác định", "reason": "Lỗi AI", "job_title": job}
 
 def get_location_gemini(ceo_name, company, linkedin_url, gemini_mgr):
     prompt = (
@@ -180,11 +221,11 @@ def get_location_gemini(ceo_name, company, linkedin_url, gemini_mgr):
         f"If unknown, reply '-'."
     )
     attempt = 0
-    backoff = 4
-    while attempt < 4:
+    backoff = 5
+    while attempt < 5:
         attempt += 1
         if not gemini_mgr.current_key():
-            return "-"
+            return "Hết key AI"
 
         try:
             client = gemini_mgr.get_client()
@@ -199,11 +240,11 @@ def get_location_gemini(ceo_name, company, linkedin_url, gemini_mgr):
                 gemini_mgr.invalidate()
                 continue
             if "503" in err_str or "UNAVAILABLE" in err_str:
-                time.sleep(backoff + random.uniform(0, 3))
-                backoff = min(backoff * 2, 60)
+                time.sleep(backoff + random.uniform(0, 5))
+                backoff = min(backoff * 2, 90)
                 continue
             break
-    return "-"
+    return "Error"
 
 def is_high_confidence(status_text):
     if not status_text:
@@ -212,61 +253,43 @@ def is_high_confidence(status_text):
     return ("xác nhận" in text and "không xác nhận" not in text) and "(cao)" in text
 
 # ==========================================
-# MAIN AUTOMATION WORKFLOW
+# MAIN AUTOMATION WORKFLOW (CHỈ XỬ LÝ A -> G)
 # ==========================================
 def run_automation_logic():
-    print("🚀 Bắt đầu kiểm tra tiến trình tự động...")
+    print("🚀 Cronjob Triggered: Bắt đầu tiến trình tự động...")
     try:
         gc = get_gspread_client()
-        data_sheet = retry_gspread_call(lambda: gc.open_by_key(DATA_SHEET_ID).worksheet("search example"))
-        data_matrix = retry_gspread_call(data_sheet.get_all_values)
-        rows = data_matrix[1:]
+        gemini_sheet = gc.open_by_key(API_KEY_SHEET_ID).worksheet("Gemini API")
+        api_sheet = gc.open_by_key(API_KEY_SHEET_ID).worksheet("Custom Search API")
+        data_sheet = gc.open_by_key(DATA_SHEET_ID).worksheet("search example")
 
-        # 1. KIỂM TRA TRƯỚC XEM CÓ DATA MỚI CẦN XỬ LÝ KHÔNG (TIẾT KIỆM TỐI ĐA)
-        todo_search = []
-        todo_location = []
+        # 0. AUDIT API KEYS (Tiết kiệm Quota)
+        run_api_sheet_audit(api_sheet)
 
-        for i, row in enumerate(rows):
-            row_idx = i + 2
-            company = row[0].strip() if len(row) > 0 else ""
-            col_b = row[1].strip() if len(row) > 1 else ""
-            col_e = row[4].strip() if len(row) > 4 else ""
-            col_f = row[5].strip() if len(row) > 5 else ""
-            location = row[6].strip() if len(row) > 6 else ""
-
-            # Nhánh 1: Cần tìm CEO Profile (Dòng có tên Cty nhưng Cột B, E, F đều chưa có kết quả)
-            if company and col_b == "" and col_e == "" and col_f == "":
-                todo_search.append({"idx": row_idx, "name": company})
-            
-            # Nhánh 2: Cần tìm Location (Đã xác nhận cao nhưng Cột G chưa có kết quả)
-            elif is_high_confidence(col_e) and location == "":
-                todo_location.append({
-                    "idx": row_idx,
-                    "company": company,
-                    "url": col_b,
-                    "name": row[2].strip() if len(row) > 2 else ""
-                })
-
-        # NẾU HOÀN TOÀN KHÔNG CÓ DỮ LIỆU MỚI THÌ THOÁT NGAY
-        if not todo_search and not todo_location:
-            print("💤 Không có dữ liệu mới nào cần chạy. Kết thúc để tránh tốn API.")
-            return
-
-        # Nạp Key Sheets
-        gemini_sheet = retry_gspread_call(lambda: gc.open_by_key(API_KEY_SHEET_ID).worksheet("Gemini API"))
-        api_sheet = retry_gspread_call(lambda: gc.open_by_key(API_KEY_SHEET_ID).worksheet("Custom Search API"))
-
+        # Nạp Key Managers
         search_key_mgr = MultiTabKeyManager(api_sheet, "SEARCH")
         search_key_mgr.load()
 
         gemini_key_mgr = MultiTabKeyManager(gemini_sheet, "GEMINI")
         gemini_key_mgr.load()
 
-        # ==========================================
-        # BƯỚC 1: XỬ LÝ CEO PROFILE
-        # ==========================================
+        # 1. BƯỚC 1: QUÉT TÌM CEO PROFILE (CỘT B:F TRỐNG)
+        print("\n⏳ [PHẦN 1] Kiểm tra danh sách tìm CEO Profile...")
+        data_matrix = data_sheet.get_all_values()
+        rows = data_matrix[1:]
+
+        todo_search = []
+        for i, row in enumerate(rows):
+            company = row[0].strip() if len(row) > 0 else ""
+            col_e = row[4].strip() if len(row) > 4 else ""
+            col_f = row[5].strip() if len(row) > 5 else ""
+
+            if company and col_e == "" and col_f == "":
+                todo_search.append({"idx": i + 2, "name": company})
+                # Đã bỏ giới hạn MAX_BATCH_SIZE -> gom toàn bộ dòng còn trống trong sheet
+
         if todo_search:
-            print(f"🚀 [PHẦN 1] Phát hiện {len(todo_search)} dòng mới cần tìm CEO Profile...")
+            print(f"🚀 Xử lý {len(todo_search)} dòng cần tìm CEO Profile...")
             for task in todo_search:
                 row_idx = task["idx"]
                 company_query = task["name"]
@@ -274,8 +297,10 @@ def run_automation_logic():
                 while True:
                     api_obj = search_key_mgr.current()
                     if not api_obj:
-                        print("🛑 ĐÃ HẾT TOÀN BỘ KEY SEARCH! Dừng Bước 1.")
-                        todo_search = []  # Dừng xử lý các dòng còn lại
+                        # Hết key search khả dụng -> dừng ngay, không gọi thêm API nào nữa
+                        # cho các dòng còn lại (todo_search vòng ngoài vẫn tiếp tục nhưng
+                        # sẽ break ngay lập tức ở đây mỗi lần, không tốn quota).
+                        print("🛑 HẾT KEY SEARCH KHẢ DỤNG!")
                         break
 
                     api_key = api_obj['key']
@@ -308,23 +333,16 @@ def run_automation_logic():
                             ai_status = "✅ Xác nhận" if ai_result.get("verified") is True else ("❌ Không xác nhận" if ai_result.get("verified") is False else "⚠️ Không rõ")
                             ai_confidence = ai_result.get("confidence", "-")
                             ai_reason = ai_result.get("reason", "-")
+
                             job_final = ai_result.get("job_title", job_raw) if (ai_result.get("verified") is True and ai_confidence.strip().lower() == "cao") else job_raw
 
                             payload = [link, name, job_final, f"{ai_status} ({ai_confidence})", ai_reason]
                             safe_sheet_update(data_sheet, f"B{row_idx}:F{row_idx}", [payload])
-                            print(f" ✅ [{row_idx}] Cập nhật B:F cho {company_query}")
-
-                            # Nếu xác nhận cao, kiểm tra và lấy luôn location để đỡ phải đợi quét lại
-                            if is_high_confidence(f"{ai_status} ({ai_confidence})"):
-                                loc = get_location_gemini(name, company_query, link, gemini_key_mgr)
-                                safe_sheet_update(data_sheet, f"G{row_idx}", [[loc]])
-                                print(f" 📍 [{row_idx}] Điền luôn Location (G): {loc}")
+                            print(f" ✅ [{row_idx}] Updated B:F cho {company_query}")
 
                         else:
-                            # ĐÓNG DÒNG ĐẦY ĐỦ ĐỂ LẦN SAU KHÔNG BỊ QUÉT LẠI
-                            payload = ["- Không tìm thấy", "-", "-", "❌ Không tìm thấy", "Không có kết quả Google Search", "-"]
-                            safe_sheet_update(data_sheet, f"B{row_idx}:G{row_idx}", [payload])
-                            print(f" ➖ [{row_idx}] Không tìm thấy CEO cho {company_query}. Đã chốt dòng.")
+                            safe_sheet_update(data_sheet, f"B{row_idx}", [["- Không tìm thấy"]])
+                            print(f" ➖ [{row_idx}] Không có kết quả cho {company_query}.")
 
                         sleep_with_jitter()
                         break
@@ -332,33 +350,46 @@ def run_automation_logic():
                     except Exception as e:
                         print(f"❌ Lỗi xử lý dòng {row_idx}: {e}")
                         break
+        else:
+            print("✅ Không có dòng nào trống ở phần CEO Profile (Cột B:F).")
 
-        # ==========================================
-        # BƯỚC 2: XỬ LÝ LOCATION CÁC DÒNG CÒN SÓT
-        # ==========================================
-        if todo_location:
-            print(f"\n🚀 [PHẦN 2] Phát hiện {len(todo_location)} dòng cần bổ sung Vị trí CEO (Cột G)...")
-            for task in todo_location:
-                if not gemini_key_mgr.current_key():
-                    print("🛑 ĐÃ HẾT TOÀN BỘ KEY GEMINI! Dừng Bước 2.")
-                    break
+        # Đợi 3 giây trước khi chuyển sang PHẦN 2 để làm rỗng Quota Rate Limit
+        time.sleep(3)
 
-                row_idx = task["idx"]
-                ceo_name = task["name"]
+        # 2. BƯỚC 2: QUÉT TÌM VỊ TRÍ CEO (CỘT G TRỐNG & CONFIDENCE CAO)
+        print("\n⏳ [PHẦN 2] Kiểm tra Vị trí CEO (Cột G)...")
+        all_rows_updated = data_sheet.get_all_values()
+        count_g = 0
 
-                if not ceo_name or ceo_name == "-":
+        for i, row in enumerate(all_rows_updated[1:]):
+            # Đã bỏ giới hạn MAX_BATCH_SIZE -> xử lý hết toàn bộ dòng đạt điều kiện
+            row_idx = i + 2
+            company = row[0].strip() if len(row) > 0 else ""
+            linkedin_url = row[1].strip() if len(row) > 1 else ""
+            ceo_name = row[2].strip() if len(row) > 2 else ""
+            confidence_status = row[4].strip() if len(row) > 4 else ""
+            location_filled = len(row) > 6 and row[6].strip()
+
+            if is_high_confidence(confidence_status) and not location_filled:
+                if not ceo_name:
                     safe_sheet_update(data_sheet, f"G{row_idx}", [["-"]])
                     continue
 
-                location = get_location_gemini(ceo_name, task["company"], task["url"], gemini_key_mgr)
+                if not gemini_key_mgr.current_key():
+                    # Hết key Gemini khả dụng -> dừng phần này ngay, không gọi thêm API
+                    print("🛑 HẾT KEY GEMINI KHẢ DỤNG! Dừng tra cứu vị trí CEO.")
+                    break
+
+                location = get_location_gemini(ceo_name, company, linkedin_url, gemini_key_mgr)
                 safe_sheet_update(data_sheet, f"G{row_idx}", [[location]])
                 print(f" 📍 [{row_idx}] Updated CEO Location (G): {location}")
+                count_g += 1
                 sleep_with_jitter()
 
-        print("\n🏁 HOÀN TẤT TIẾN TRÌNH.")
+        print(f"\n🏁 HOÀN THÀNH TOÀN BỘ TIẾN TRÌNH AUTOMATION (A -> G). Tổng số vị trí CEO đã cập nhật: {count_g}")
 
     except Exception as general_err:
-        print(f"❌ Lỗi: {general_err}")
+        print(f"❌ Tiến trình gặp lỗi nghiêm trọng: {general_err}")
 
 # ==========================================
 # ENDPOINT FASTAPI FOR CRON-JOB.ORG
